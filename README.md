@@ -1,7 +1,4 @@
 # AD PowerShell FixTools
-
-Created and maintained by **AdrenSnyder**.
-
 > This project is provided **AS IS**, without warranty of any kind. Use these scripts at your own risk and always review the code before running it in a production environment.  
 > The author is not responsible for service outages, data loss, broken domains, failed replications, lost SYSVOL content, angry users, unexpected side effects, thermonuclear war, or any other consequence caused directly or indirectly by the use or misuse of these tools.
 
