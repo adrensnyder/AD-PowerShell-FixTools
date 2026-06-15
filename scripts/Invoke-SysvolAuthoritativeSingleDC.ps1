@@ -448,51 +448,50 @@ function Invoke-PrerequisiteGate {
 function Show-Help {
     $scriptName = Get-ScriptDisplayName
     $scriptLogPath = Get-ScriptLogPath
+    $defaultBackupRoot = Get-DefaultBackupRoot
 
-    Write-Section "SYSVOL DFSR Authoritative Recovery Helper - Single DC Only" Cyan
-    Write-Host "Usage:" -ForegroundColor White
-    Write-Host ("  .\{0}" -f $scriptName) -ForegroundColor Gray
+    Write-Section "Help - Invoke-SysvolAuthoritativeSingleDC" Cyan
+
+    Write-Host "This script checks and repairs a specific DFSR SYSVOL Content Freshness failure on a single remaining FSMO-owning Domain Controller." -ForegroundColor White
+    Write-Host "It blocks unsafe scenarios, such as reachable additional DCs or stale AD Sites and Services server objects." -ForegroundColor Gray
+    Write-Blank
+
+    Write-Host "Parameters:" -ForegroundColor White
+    @(
+        [pscustomobject]@{
+            Parameter = '--help'
+            Required  = 'No'
+            Description = 'Shows this help screen.'
+        }
+        [pscustomobject]@{
+            Parameter = '--check'
+            Required  = 'No'
+            Description = 'Runs prerequisite and safety checks only. No DFSR/AD recovery changes are made.'
+        }
+        [pscustomobject]@{
+            Parameter = '--fix'
+            Required  = 'No'
+            Description = 'Runs checks first, then repairs only if the supported single-DC DFSR SYSVOL problem is confirmed.'
+        }
+        [pscustomobject]@{
+            Parameter = '--backup-path <path>'
+            Required  = 'No'
+            Description = 'Optional with --fix. Stores the timestamped SYSVOL backup under the specified root path.'
+        }
+    ) | Format-Table -AutoSize | Out-String | ForEach-Object { Write-Host $_.TrimEnd() -ForegroundColor Gray }
+
+    Write-Host "Notes:" -ForegroundColor White
+    Write-Host ("  Log file: {0}" -f $scriptLogPath) -ForegroundColor Gray
+    Write-Host ("  Default backup root: {0}" -f $defaultBackupRoot) -ForegroundColor Gray
+    Write-Host "  Run from an elevated PowerShell session on the remaining FSMO-owning DC." -ForegroundColor Gray
+    Write-Blank
+
+    Write-Host "Examples:" -ForegroundColor White
+    Write-Host ("  .\{0} --help" -f $scriptName) -ForegroundColor Gray
     Write-Host ("  .\{0} --check" -f $scriptName) -ForegroundColor Gray
     Write-Host ("  .\{0} --fix" -f $scriptName) -ForegroundColor Gray
     Write-Host ("  .\{0} --fix --backup-path D:\SafeBackups" -f $scriptName) -ForegroundColor Gray
-    Write-Host ('  .\{0} --fix --backup-path "D:\Safe Backups"' -f $scriptName) -ForegroundColor Gray
-    Write-Blank
-    Write-Host "Execution policy bypass examples:" -ForegroundColor White
     Write-Host ("  powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\{0} --check" -f $scriptName) -ForegroundColor Gray
-    Write-Host ("  powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\{0} --fix" -f $scriptName) -ForegroundColor Gray
-    Write-Host ("  powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\{0} --fix --backup-path D:\SafeBackups" -f $scriptName) -ForegroundColor Gray
-    Write-Blank
-    Write-Host "Logging:" -ForegroundColor White
-    Write-Host ("  Log file: {0}" -f $scriptLogPath) -ForegroundColor Gray
-    Write-Host "  The log file is stored next to this script and appended on each --check or --fix run." -ForegroundColor Gray
-    Write-Blank
-    Write-Host "Backup location:" -ForegroundColor White
-    Write-Host ("  Default backup root: {0}" -f (Get-DefaultBackupRoot)) -ForegroundColor Gray
-    Write-Host "  --fix creates a timestamped SYSVOL_Backup_yyyyMMdd_HHmmss folder below the backup root." -ForegroundColor Gray
-    Write-Host "  Use --backup-path <path> to override the backup root." -ForegroundColor Gray
-    Write-Blank
-    Write-Host "Note: the bypass is passed to powershell.exe, not to the script. There is no internal --bypass mode." -ForegroundColor DarkYellow
-    Write-Blank
-    Write-Host "Modes:" -ForegroundColor White
-    Write-Host "  --check   Check prerequisites first. If tools are missing, ask before installing them." -ForegroundColor Gray
-    Write-Host "            After prerequisites are available, run sanity checks only. No DFSR/AD recovery changes are made." -ForegroundColor Gray
-    Write-Host "            If stale Sites and Services objects are detected, ask whether to open dssite.msc at the end." -ForegroundColor Gray
-    Write-Host "  --fix     Run the shared prerequisite and sanity-check orchestrator first.
-            If the supported problem is detected and no blockers exist, perform the fix." -ForegroundColor Gray
-    Write-Blank
-    Write-Host "Final summary:" -ForegroundColor White
-    Write-Host "  The final Execution summary includes Errors, Warnings, Log file, and Suggested actions." -ForegroundColor Gray
-    Write-Host "  Suggested actions are mode-aware: --check may recommend --fix, while --fix will never recommend starting --fix again." -ForegroundColor Gray
-    Write-Blank
-    Write-Host "Important safety scope:" -ForegroundColor White
-    Write-Host "  This script is designed only for a single remaining Domain Controller that owns all FSMO roles." -ForegroundColor Gray
-    Write-Host "  If another Domain Controller is reachable, the fix is blocked." -ForegroundColor Gray
-    Write-Host "  Stale or orphaned AD Sites and Services server objects are reported and block --fix." -ForegroundColor Gray
-    Write-Blank
-    Write-Host "The supported failure pattern is:" -ForegroundColor White
-    Write-Host "  - DFSR SYSVOL replicated folder is in State 5 / In Error, and" -ForegroundColor Gray
-    Write-Host "  - DFS Replication log contains Event ID 4012 or Content Freshness / Error 9061 evidence, and" -ForegroundColor Gray
-    Write-Host "  - The local DC is the only reachable DC and owns all FSMO roles." -ForegroundColor Gray
     Write-Blank
 }
 
