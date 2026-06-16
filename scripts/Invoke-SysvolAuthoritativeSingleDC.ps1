@@ -9,9 +9,11 @@
 
       - The local server is the only remaining/reachable Domain Controller.
       - The local server owns all five FSMO roles.
-      - DFSR SYSVOL is stuck in State 5 / In Error.
-      - The DFS Replication event log shows Content Freshness evidence, usually Event ID 4012,
-        MaxOfflineTimeInDays, stale SYSVOL data, or Error 9061.
+      - DFSR SYSVOL is stuck in State 5 / In Error with Content Freshness evidence, or
+      - DFSR SYSVOL is stuck in State 2 / Initial Sync because the local seeding
+        registry Parent Computer points to a stale/non-local Domain Controller.
+      - For State 5, the DFS Replication event log shows Content Freshness evidence, usually
+        Event ID 4012, MaxOfflineTimeInDays, stale SYSVOL data, or Error 9061.
       - Active Directory Sites and Services must not contain non-local/stale server objects.
         The script detects those objects and blocks --fix until they are manually verified and removed.
 
@@ -29,13 +31,17 @@
     If installation is declined or fails, the script stops and explains what is missing.
 
     When run with --fix, the script first performs the same checks. It continues only if the
-    detected condition matches the supported single-DC Content Freshness / stale SYSVOL problem.
+    detected condition matches a supported single-DC DFSR SYSVOL problem: Content Freshness /
+    stale SYSVOL, or Initial Sync with a stale/non-local SYSVOL seeding Parent Computer.
 
     During --fix, the script:
       1. Creates and verifies a SYSVOL backup next to this script by default, unless --backup-path is supplied.
-      2. Disables the local DFSR SYSVOL subscription.
-      3. Sets msDFSR-Options=1 to mark the local SYSVOL as authoritative.
-      4. Forces DFSR to poll Active Directory, with retries because DFSR/WMI can need
+      2. Stops DFSR and, if needed, corrects the local SYSVOL seeding registry Parent Computer
+         to the local DC FQDN. If corrected, DFSR is started once to reload the registry value,
+         then stopped again before the authoritative D4 sequence begins.
+      3. Disables the local DFSR SYSVOL subscription.
+      4. Sets msDFSR-Options=1 to mark the local SYSVOL as authoritative.
+      5. Forces DFSR to poll Active Directory, with retries because DFSR/WMI can need
          a short time to expose PollDsNow immediately after the DFSR service starts.
       5. Re-enables the local DFSR SYSVOL subscription.
       6. Restarts DFSR and Netlogon.
@@ -156,6 +162,9 @@
 
 CHANGE NOTE:
 - Backup consistency validation intentionally excludes domain\DfsrPrivate. This is DFSR internal private metadata, not the usable SYSVOL GPO/script payload. Protected ConflictAndDeleted/Deleted/Installing/PreExisting entries there can fail inventory comparison even when the Policies and scripts backup is valid.
+- Robocopy now also excludes DfsrPrivate explicitly with /XD DfsrPrivate, in addition to /XJ.
+- Added DFSR SYSVOL seeding Parent Computer validation and correction. In --fix, a stale/non-local Parent Computer is corrected to the local DC while DFSR is stopped. DFSR is then started once to reload the registry value, stopped again, and only then the authoritative D4 sequence begins.
+- Added pre-change registry export of HKLM\SYSTEM\CurrentControlSet\Services\DFSR\Parameters\SysVols into the SYSVOL backup folder before any DFSR/AD/registry recovery changes are made.
 - The shared check orchestrator is mode-aware. When invoked by --fix, it does not suggest running --fix again; it reports whether the fix preflight passed, was blocked, or must stop.
 #>
 
@@ -187,6 +196,24 @@ function Remove-WarningsMatching {
             }
         }
     }
+}
+
+function Clear-ResolvedRecoveryWarnings {
+    <#
+        During --fix the shared preflight intentionally records the initial broken state
+        (State 5 / In Error and Event ID 4012 evidence). If the recovery later validates
+        State 4 / Normal, Event ID 4602, SYSVOL/NETLOGON shares, and dcdiag successfully,
+        those initial diagnostic warnings are no longer unresolved final warnings.
+    #>
+    if (-not $Script:Context.Contains('RecoverySucceeded')) { return }
+    if (-not [bool]$Script:Context['RecoverySucceeded']) { return }
+
+    Remove-WarningsMatching -Patterns @(
+        '^DFSR SYSVOL state is In Error\.$',
+        '^DFSR SYSVOL state is Initial Sync\.$',
+        '^DFSR SYSVOL seeding Parent Computer points to a non-local or stale computer: .+$',
+        '^Found DFSR problem evidence matching Event ID 4012 / Content Freshness / Error 9061\. Count in latest scan: \d+$'
+    )
 }
 
 function Write-Blank {
@@ -686,11 +713,11 @@ function Get-SuggestedActions {
         if ([string]::IsNullOrWhiteSpace($runMode)) { $runMode = [string]$Script:RunMode }
 
         if ($runMode -eq 'Fix') {
-            $actions.Add((New-SuggestedActionObject -Severity 'INFO' -Message 'Wait for the current --fix run to complete. The shared preflight has confirmed the supported single-DC DFSR SYSVOL Content Freshness recovery scenario and the recovery phase is now responsible for continuing or stopping safely.')) | Out-Null
+            $actions.Add((New-SuggestedActionObject -Severity 'INFO' -Message 'Wait for the current --fix run to complete. The shared preflight has confirmed a supported single-DC DFSR SYSVOL recovery scenario and the recovery phase is now responsible for continuing or stopping safely.')) | Out-Null
             return $actions
         }
 
-        $actions.Add((New-SuggestedActionObject -Severity 'WARN' -Message ("Run .\{0} --fix from an elevated PowerShell session. This starts the supported single-DC DFSR SYSVOL Content Freshness recovery and validates the SYSVOL backup before modifying DFSR/AD." -f $scriptName))) | Out-Null
+        $actions.Add((New-SuggestedActionObject -Severity 'WARN' -Message ("Run .\{0} --fix from an elevated PowerShell session. This starts the supported single-DC DFSR SYSVOL recovery and validates the SYSVOL backup before modifying DFSR/AD." -f $scriptName))) | Out-Null
         $actions.Add((New-SuggestedActionObject -Severity 'INFO' -Message 'Review the backup validation result shown during --fix. This confirms SYSVOL was copied consistently before the recovery makes DFSR/AD changes.')) | Out-Null
         return $actions
     }
@@ -701,7 +728,7 @@ function Get-SuggestedActions {
     }
 
     if ($null -ne $dfsrState) {
-        $actions.Add((New-SuggestedActionObject -Severity 'WARN' -Message 'Do not run --fix. Investigate the current DFSR state and DFS Replication events manually because the supported single-DC Content Freshness failure pattern was not detected.')) | Out-Null
+        $actions.Add((New-SuggestedActionObject -Severity 'WARN' -Message 'Do not run --fix. The supported single-DC recovery pattern was not detected. The script supports State 5 with Content Freshness evidence, or State 2 Initial Sync with a stale/non-local SYSVOL seeding Parent Computer.')) | Out-Null
         return $actions
     }
 
@@ -851,6 +878,121 @@ function Test-IsLocalName {
     return (($LocalNames -contains $lower) -or ($LocalNames -contains $short))
 }
 
+
+function Get-DfsrSysvolSeedingParentInfo {
+    param(
+        [Parameter(Mandatory=$true)][string]$DomainDnsRoot,
+        [Parameter(Mandatory=$true)][string]$LocalDcHostName,
+        [Parameter(Mandatory=$true)][string[]]$LocalNames
+    )
+
+    $registryPath = "HKLM:\SYSTEM\CurrentControlSet\Services\DFSR\Parameters\SysVols\Seeding SysVols\$DomainDnsRoot"
+    $expectedParent = [string]$LocalDcHostName
+    if ([string]::IsNullOrWhiteSpace($expectedParent)) {
+        $expectedParent = "$env:COMPUTERNAME.$DomainDnsRoot"
+    }
+
+    $exists = Test-Path -LiteralPath $registryPath
+    $parentComputer = $null
+    $readError = $null
+
+    if ($exists) {
+        try {
+            $props = Get-ItemProperty -LiteralPath $registryPath -ErrorAction Stop
+            $parentComputer = [string]$props.'Parent Computer'
+        }
+        catch {
+            $readError = $_.Exception.Message
+        }
+    }
+
+    $hasParent = -not [string]::IsNullOrWhiteSpace($parentComputer)
+    $isLocalParent = $false
+    if ($hasParent) {
+        $isLocalParent = Test-IsLocalName -Name $parentComputer -LocalNames $LocalNames
+    }
+
+    $needsCorrection = ($exists -and $hasParent -and -not $isLocalParent)
+
+    return [pscustomobject]@{
+        RegistryPath           = $registryPath
+        Exists                 = [bool]$exists
+        ParentComputer         = $parentComputer
+        ExpectedParentComputer = $expectedParent
+        HasParentComputer      = [bool]$hasParent
+        IsLocalParent          = [bool]$isLocalParent
+        NeedsCorrection        = [bool]$needsCorrection
+        ReadError              = $readError
+    }
+}
+
+function Set-DfsrSysvolSeedingParentToLocal {
+    param(
+        [Parameter(Mandatory=$true)][object]$Info
+    )
+
+    if (-not [bool]$Info.Exists) {
+        Write-Info "DFSR SYSVOL seeding registry key does not exist. No registry correction is required."
+        return $false
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace([string]$Info.ReadError)) {
+        Stop-WithError "Unable to read DFSR SYSVOL seeding registry key before correction: $($Info.ReadError)" @(
+            "Registry path: $($Info.RegistryPath)",
+            'No DFSR/AD recovery changes were made after this registry read failure.'
+        )
+    }
+
+    if (-not [bool]$Info.HasParentComputer) {
+        Write-Info "DFSR SYSVOL seeding Parent Computer is empty. No registry correction is required."
+        return $false
+    }
+
+    if (-not [bool]$Info.NeedsCorrection) {
+        Write-Ok "DFSR SYSVOL seeding Parent Computer already points to the local DC."
+        return $false
+    }
+
+    $oldParent = [string]$Info.ParentComputer
+    $newParent = [string]$Info.ExpectedParentComputer
+
+    Write-WarnMsg "Correcting DFSR SYSVOL seeding Parent Computer from '$oldParent' to '$newParent'."
+    Set-ItemProperty -LiteralPath ([string]$Info.RegistryPath) -Name 'Parent Computer' -Value $newParent -ErrorAction Stop
+
+    $verify = Get-ItemProperty -LiteralPath ([string]$Info.RegistryPath) -ErrorAction Stop
+    $actual = [string]$verify.'Parent Computer'
+    if ($actual -ne $newParent) {
+        Stop-WithError "DFSR SYSVOL seeding Parent Computer verification failed after registry correction." @(
+            "Registry path: $($Info.RegistryPath)",
+            "Expected: $newParent",
+            "Actual: $actual"
+        )
+    }
+
+    Write-Ok "DFSR SYSVOL seeding Parent Computer corrected to local DC: $newParent"
+    Add-Done "DFSR SYSVOL seeding Parent Computer corrected."
+    return $true
+}
+
+function Invoke-DfsrServiceReloadAfterSeedingParentCorrection {
+    Write-Section "Reload DFSR after SYSVOL seeding parent registry correction" Cyan
+    Write-Info "Starting DFSR once after the registry correction so the service reloads the SYSVOL seeding Parent Computer value before the authoritative D4 sequence."
+
+    Start-Service DFSR
+    Write-Ok "DFSR service started after SYSVOL seeding Parent Computer correction."
+
+    try {
+        Invoke-DfsrPollAd -Context 'after SYSVOL seeding Parent Computer registry correction'
+    }
+    catch {
+        Write-WarnMsg "DFSR AD polling after registry correction failed or was unavailable: $($_.Exception.Message)"
+    }
+
+    Stop-Service DFSR -Force
+    Write-Ok "DFSR service stopped again before authoritative D4 attribute changes."
+    Add-Done "DFSR service reloaded after SYSVOL seeding Parent Computer correction."
+}
+
 function Test-IsReparsePoint {
     param([Parameter(Mandatory=$true)][System.IO.FileSystemInfo]$Item)
 
@@ -876,6 +1018,49 @@ function Test-RelativePathExcluded {
     return $false
 }
 
+function Get-InventoryItemsForBackupValidation {
+    param(
+        [Parameter(Mandatory=$true)][string]$Path,
+        [switch]$ExcludeReparsePoints,
+        [string[]]$ExcludeRelativePrefixes = @()
+    )
+
+    if (-not (Test-Path -LiteralPath $Path)) { return @() }
+
+    $root = (Get-Item -LiteralPath $Path -Force -ErrorAction Stop).FullName.TrimEnd('\')
+    $items = New-Object System.Collections.Generic.List[System.IO.FileSystemInfo]
+
+    function Add-InventoryItemsForBackupValidation {
+        param([Parameter(Mandatory=$true)][string]$CurrentPath)
+
+        $children = @(Get-ChildItem -LiteralPath $CurrentPath -Force -ErrorAction Stop)
+        foreach ($child in $children) {
+            if ($child.FullName.Length -le $root.Length) { continue }
+
+            $relative = $child.FullName.Substring($root.Length).TrimStart('\')
+            if ([string]::IsNullOrWhiteSpace($relative)) { continue }
+
+            if (Test-RelativePathExcluded -RelativePath $relative -ExcludeRelativePrefixes $ExcludeRelativePrefixes) {
+                continue
+            }
+
+            $isReparsePoint = Test-IsReparsePoint -Item $child
+            if ($ExcludeReparsePoints -and $isReparsePoint) {
+                continue
+            }
+
+            $items.Add($child) | Out-Null
+
+            if ($child.PSIsContainer) {
+                Add-InventoryItemsForBackupValidation -CurrentPath $child.FullName
+            }
+        }
+    }
+
+    Add-InventoryItemsForBackupValidation -CurrentPath $root
+    return @($items)
+}
+
 function Get-TreeStats {
     param(
         [Parameter(Mandatory=$true)][string]$Path,
@@ -889,19 +1074,7 @@ function Get-TreeStats {
         return [pscustomobject]@{ Path = $Path; Exists = $false; Directories = 0; Files = 0; Bytes = 0; ReparseExcluded = [bool]$ExcludeReparsePoints; RelativeExclusions = $relativeExclusionsText }
     }
 
-    $root = (Get-Item -LiteralPath $Path -Force -ErrorAction Stop).FullName.TrimEnd('\')
-    $items = @(Get-ChildItem -LiteralPath $Path -Force -Recurse -ErrorAction Stop)
-    if ($ExcludeReparsePoints) {
-        $items = @($items | Where-Object { -not (Test-IsReparsePoint -Item $_) })
-    }
-
-    if ($ExcludeRelativePrefixes -and $ExcludeRelativePrefixes.Count -gt 0) {
-        $items = @($items | Where-Object {
-            if ($_.FullName.Length -le $root.Length) { return $false }
-            $relative = $_.FullName.Substring($root.Length).TrimStart('\')
-            -not (Test-RelativePathExcluded -RelativePath $relative -ExcludeRelativePrefixes $ExcludeRelativePrefixes)
-        })
-    }
+    $items = @(Get-InventoryItemsForBackupValidation -Path $Path -ExcludeReparsePoints:$ExcludeReparsePoints -ExcludeRelativePrefixes $ExcludeRelativePrefixes)
 
     $dirs = @($items | Where-Object { $_.PSIsContainer }).Count
     $fileItems = @($items | Where-Object { -not $_.PSIsContainer })
@@ -931,7 +1104,7 @@ function Get-RelativeTreeEntries {
     if (-not (Test-Path -LiteralPath $Path)) { return @() }
 
     $root = (Get-Item -LiteralPath $Path -Force -ErrorAction Stop).FullName.TrimEnd('\')
-    $items = @(Get-ChildItem -LiteralPath $root -Force -Recurse -ErrorAction Stop)
+    $items = @(Get-InventoryItemsForBackupValidation -Path $root -ExcludeReparsePoints:$ExcludeReparsePoints -ExcludeRelativePrefixes $ExcludeRelativePrefixes)
 
     if ($Kind -eq 'Directory') {
         $items = @($items | Where-Object { $_.PSIsContainer })
@@ -940,16 +1113,11 @@ function Get-RelativeTreeEntries {
         $items = @($items | Where-Object { -not $_.PSIsContainer })
     }
 
-    if ($ExcludeReparsePoints) {
-        $items = @($items | Where-Object { -not (Test-IsReparsePoint -Item $_) })
-    }
-
     $result = New-Object System.Collections.Generic.List[string]
     foreach ($item in $items) {
         if ($item.FullName.Length -le $root.Length) { continue }
         $relative = $item.FullName.Substring($root.Length).TrimStart('\')
         if ([string]::IsNullOrWhiteSpace($relative)) { continue }
-        if (Test-RelativePathExcluded -RelativePath $relative -ExcludeRelativePrefixes $ExcludeRelativePrefixes) { continue }
         $result.Add($relative) | Out-Null
     }
 
@@ -1080,7 +1248,7 @@ function Get-DfsrProblemEvents {
 function Show-RecentDfsrEvents {
     Write-SubSection "Recent relevant DFS Replication events"
     try {
-        $events = Get-WinEvent -FilterHashtable @{ LogName = 'DFS Replication'; Id = 4012,4114,4602,4604,4614,5002,5008,5014 } -MaxEvents 20 -ErrorAction Stop
+        $events = Get-WinEvent -FilterHashtable @{ LogName = 'DFS Replication'; Id = 4012,4114,4602,4604,4612,4614,5002,5008,5014 } -MaxEvents 20 -ErrorAction Stop
         if (-not $events) {
             Write-Info "No relevant DFS Replication events found in the latest event scan."
             return
@@ -1561,6 +1729,34 @@ function Invoke-SanityCheck {
     Write-Ok "Local SYSVOL Subscription object found."
     Add-Done "DFSR SYSVOL subscription check completed."
 
+    Write-SubSection "DFSR SYSVOL seeding parent registry check"
+    $seedingParentInfo = Get-DfsrSysvolSeedingParentInfo -DomainDnsRoot $domain.DNSRoot -LocalDcHostName $localDc.HostName -LocalNames $localNames
+    $Script:Context['DfsrSeedingParentInfo'] = $seedingParentInfo
+    $seedingParentInfo | Select-Object RegistryPath,Exists,ParentComputer,ExpectedParentComputer,IsLocalParent,NeedsCorrection,ReadError | Format-List | Out-String | ForEach-Object { Write-Host $_ }
+
+    if (-not $seedingParentInfo.Exists) {
+        Write-Info "DFSR SYSVOL seeding registry key was not found. This can be normal after SYSVOL is already initialized."
+    }
+    elseif (-not [string]::IsNullOrWhiteSpace([string]$seedingParentInfo.ReadError)) {
+        Stop-WithError "Unable to read DFSR SYSVOL seeding registry key: $($seedingParentInfo.ReadError)" @("Registry path: $($seedingParentInfo.RegistryPath)")
+    }
+    elseif (-not $seedingParentInfo.HasParentComputer) {
+        Write-Info "DFSR SYSVOL seeding Parent Computer is empty."
+    }
+    elseif ($seedingParentInfo.NeedsCorrection) {
+        Write-WarnMsg "DFSR SYSVOL seeding Parent Computer points to a non-local or stale computer: $($seedingParentInfo.ParentComputer)"
+        if ($ForFix) {
+            Write-Info "The value will be corrected to the local DC during --fix while DFSR is stopped. DFSR will then be started once to reload the registry value before the authoritative D4 sequence."
+        }
+        else {
+            Write-Info "Run --fix only if the remaining safety checks also identify a supported single-DC recovery scenario."
+        }
+    }
+    else {
+        Write-Ok "DFSR SYSVOL seeding Parent Computer is local."
+    }
+    Add-Done "DFSR SYSVOL seeding parent registry check completed."
+
     Write-SubSection "DFSR replicated folder state"
     $dfsrInfo = Get-DfsrSysvolInfo
     if (-not $dfsrInfo) {
@@ -1581,8 +1777,11 @@ function Invoke-SanityCheck {
     elseif ([int]$dfsrInfo.State -eq 5) {
         Write-WarnMsg "DFSR SYSVOL state is In Error."
     }
+    elseif ([int]$dfsrInfo.State -eq 2) {
+        Write-WarnMsg "DFSR SYSVOL state is Initial Sync."
+    }
     else {
-        Write-WarnMsg "DFSR SYSVOL state is not Normal and not the expected State 5 error: $stateText"
+        Write-WarnMsg "DFSR SYSVOL state is not Normal and not one of the expected supported error states: $stateText"
     }
     Add-Done "DFSR state check completed."
 
@@ -1608,17 +1807,28 @@ function Invoke-SanityCheck {
     Add-Done "Service diagnostics completed."
 
 
-    $problemMatches = $false
-    if (([int]$dfsrInfo.State -eq 5) -and ($problemEvents.Count -gt 0)) {
-        $problemMatches = $true
+    $contentFreshnessMatches = (([int]$dfsrInfo.State -eq 5) -and ($problemEvents.Count -gt 0))
+    $initialSyncSeedingParentMatches = $false
+    if ($Script:Context.Contains('DfsrSeedingParentInfo') -and $Script:Context['DfsrSeedingParentInfo']) {
+        $initialSyncSeedingParentMatches = (([int]$dfsrInfo.State -eq 2) -and [bool]$Script:Context['DfsrSeedingParentInfo'].NeedsCorrection)
     }
+    $problemMatches = ($contentFreshnessMatches -or $initialSyncSeedingParentMatches)
 
     $Script:Context['ProblemMatches'] = $problemMatches
+    $Script:Context['ContentFreshnessMatches'] = $contentFreshnessMatches
+    $Script:Context['InitialSyncSeedingParentMatches'] = $initialSyncSeedingParentMatches
     $siteBlockers = @()
     if ($Script:Context.Contains('SitesServerObjectBlockers')) {
         $siteBlockers = @($Script:Context['SitesServerObjectBlockers'])
     }
     $hasSiteBlockers = ($siteBlockers.Count -gt 0)
+
+    if ($contentFreshnessMatches) {
+        Write-Info "Supported recovery pattern: DFSR State 5 / In Error with Content Freshness evidence."
+    }
+    if ($initialSyncSeedingParentMatches) {
+        Write-Info "Supported recovery pattern: DFSR State 2 / Initial Sync with stale or non-local SYSVOL seeding Parent Computer."
+    }
 
     if ($problemMatches) {
         if ($hasSiteBlockers) {
@@ -1696,6 +1906,69 @@ function Get-RobocopyErrorSummary {
     return @($result)
 }
 
+
+function Export-DfsrSysvolRegistryBackup {
+    param(
+        [Parameter(Mandatory=$true)][string]$BackupPath
+    )
+
+    Write-SubSection "DFSR SYSVOL registry backup"
+
+    if (-not (Test-Path -LiteralPath $BackupPath -PathType Container)) {
+        try {
+            New-Item -ItemType Directory -Path $BackupPath -Force -ErrorAction Stop | Out-Null
+        }
+        catch {
+            Stop-WithError "Unable to create backup folder before registry export: $BackupPath. Error: $($_.Exception.Message)" @(
+                'No DFSR/AD/registry recovery changes were made.',
+                'Create the backup folder manually or use --backup-path with a writable location.'
+            )
+        }
+    }
+
+    $registryKey = 'HKLM\SYSTEM\CurrentControlSet\Services\DFSR\Parameters\SysVols'
+    $registryExportPath = Join-Path $BackupPath 'DFSR_SysVols_registry_backup.reg'
+    $registrySnapshotPath = Join-Path $BackupPath 'DFSR_SysVols_registry_snapshot.txt'
+
+    Write-Info "Registry key: $registryKey"
+    Write-Info "Registry export: $registryExportPath"
+
+    $regOutput = @(& reg.exe export $registryKey $registryExportPath /y 2>&1)
+    $regExitCode = $LASTEXITCODE
+    $regOutput | ForEach-Object { Write-Host $_ }
+    Write-Info "reg.exe export exit code: $regExitCode"
+
+    if ($regExitCode -ne 0 -or -not (Test-Path -LiteralPath $registryExportPath -PathType Leaf)) {
+        Stop-WithError "Unable to export DFSR SYSVOL registry key before recovery changes." @(
+            "Registry key: $registryKey",
+            "Expected export file: $registryExportPath",
+            'No DFSR/AD/registry recovery changes were made after this registry backup failure.'
+        )
+    }
+
+    try {
+        Get-ChildItem -LiteralPath 'HKLM:\SYSTEM\CurrentControlSet\Services\DFSR\Parameters\SysVols' -Recurse -Force -ErrorAction Stop |
+            ForEach-Object {
+                $_.Name
+                try {
+                    Get-ItemProperty -LiteralPath $_.PSPath -ErrorAction Stop | Format-List | Out-String
+                }
+                catch {
+                    "Unable to read values for $($_.Name): $($_.Exception.Message)"
+                }
+                ''
+            } | Out-File -LiteralPath $registrySnapshotPath -Encoding UTF8 -Force
+        Write-Info "Readable registry snapshot: $registrySnapshotPath"
+    }
+    catch {
+        Write-WarnMsg "Registry .reg export succeeded, but the readable text snapshot could not be created: $($_.Exception.Message)"
+    }
+
+    $Script:Context['DfsrSysvolRegistryBackupPath'] = $registryExportPath
+    Write-Ok "DFSR SYSVOL registry key exported before recovery changes."
+    Add-Done "DFSR SYSVOL registry backup completed: $registryExportPath"
+}
+
 function Invoke-BackupSysvol {
     Write-Section "SYSVOL backup and consistency verification" Cyan
 
@@ -1715,10 +1988,25 @@ function Invoke-BackupSysvol {
     Write-Info "Source: $source"
     Write-Info "Backup root: $backupRoot"
     Write-Info "Backup: $backupPath"
-    Write-Info "Robocopy options: /MIR /R:1 /W:1 /XJ /COPY:DAT /DCOPY:DAT"
-    Write-Info "Note: /XJ excludes junctions/reparse points. Backup verification uses the same rule to avoid false failures."
 
-    $robocopyArgs = @($source, $backupPath, '/MIR', '/R:1', '/W:1', '/XJ', '/COPY:DAT', '/DCOPY:DAT')
+    try {
+        New-Item -ItemType Directory -Path $backupPath -Force -ErrorAction Stop | Out-Null
+        Write-Ok "Backup folder created: $backupPath"
+    }
+    catch {
+        Stop-WithError "Unable to create backup folder: $backupPath. Error: $($_.Exception.Message)" @(
+            'No DFSR/AD/registry recovery changes were made.',
+            'Create the backup folder manually or use --backup-path with a writable location.'
+        )
+    }
+
+    Export-DfsrSysvolRegistryBackup -BackupPath $backupPath
+
+    Write-Info "Robocopy options: /MIR /R:1 /W:1 /XJ /XD DfsrPrivate /COPY:DAT /DCOPY:DAT"
+    Write-Info "Note: /XJ excludes junctions/reparse points. /XD DfsrPrivate explicitly excludes DFSR internal private metadata from the backup."
+    Write-Info "Backup verification uses the same DfsrPrivate exclusion to avoid false failures."
+
+    $robocopyArgs = @($source, $backupPath, '/MIR', '/R:1', '/W:1', '/XJ', '/XD', 'DfsrPrivate', '/COPY:DAT', '/DCOPY:DAT')
     $robocopyOutput = @(& robocopy @robocopyArgs 2>&1)
     $rc = $LASTEXITCODE
     $robocopyOutput | ForEach-Object { Write-Host $_ }
@@ -1938,11 +2226,19 @@ function Assert-FixEligibilityFromSharedChecks {
             Stop-WithError "The supported failure pattern was not detected because DFSR SYSVOL is already State 4 / Normal. No fix is required." @('No authoritative SYSVOL recovery was executed.')
         }
         else {
-            Stop-WithError "The supported failure pattern was not detected. DFSR is not State 5 with Event ID 4012 / Content Freshness / Error 9061 evidence." @('Investigate the current DFSR state and events before using this specific recovery procedure.')
+            Stop-WithError "The supported failure pattern was not detected. DFSR is neither State 5 with Event ID 4012 / Content Freshness / Error 9061 evidence, nor State 2 Initial Sync with a stale/non-local SYSVOL seeding Parent Computer." @('Investigate the current DFSR state, DFS Replication events, and SYSVOL seeding registry value before using this specific recovery procedure.')
         }
     }
 
-    Write-Ok "The detected condition matches the supported single-DC DFSR SYSVOL Content Freshness recovery scenario."
+    if ($Script:Context.Contains('InitialSyncSeedingParentMatches') -and [bool]$Script:Context['InitialSyncSeedingParentMatches']) {
+        Write-Ok "The detected condition matches the supported single-DC DFSR SYSVOL Initial Sync / stale seeding parent recovery scenario."
+    }
+    elseif ($Script:Context.Contains('ContentFreshnessMatches') -and [bool]$Script:Context['ContentFreshnessMatches']) {
+        Write-Ok "The detected condition matches the supported single-DC DFSR SYSVOL Content Freshness recovery scenario."
+    }
+    else {
+        Write-Ok "The detected condition matches a supported single-DC DFSR SYSVOL recovery scenario."
+    }
     Add-Done "Fix eligibility confirmed by shared check orchestrator."
 }
 
@@ -1980,18 +2276,36 @@ function Invoke-Fix {
     Invoke-BackupSysvol
 
     $sysvolSubDn = [string]$Script:Context['SysvolSubDn']
+    $seedingParentInfo = $null
+    if ($Script:Context.Contains('DfsrSeedingParentInfo')) {
+        $seedingParentInfo = $Script:Context['DfsrSeedingParentInfo']
+    }
 
     try {
-        Write-Section "Step 1 - Stop DFSR and disable local SYSVOL subscription" Cyan
+        Write-Section "Step 1 - Stop DFSR and correct SYSVOL seeding parent if needed" Cyan
         Set-Service DFSR -StartupType Manual
         Write-Ok "DFSR startup type set to Manual."
         Stop-Service DFSR -Force
         Write-Ok "DFSR service stopped."
+
+        $seedingParentChanged = $false
+        if ($seedingParentInfo) {
+            $seedingParentChanged = [bool](Set-DfsrSysvolSeedingParentToLocal -Info $seedingParentInfo)
+        }
+        else {
+            Write-Info "DFSR SYSVOL seeding Parent Computer information was not collected during preflight. No registry correction was attempted."
+        }
+
+        if ($seedingParentChanged) {
+            Invoke-DfsrServiceReloadAfterSeedingParentCorrection
+        }
+
+        Write-Section "Step 2 - Disable local SYSVOL subscription and mark authoritative" Cyan
         Set-ADObject -Identity $sysvolSubDn -Replace @{ 'msDFSR-Enabled' = $false; 'msDFSR-Options' = 1 }
         Write-Ok "Set msDFSR-Enabled=FALSE and msDFSR-Options=1 on local SYSVOL Subscription."
         Add-Done "Local SYSVOL Subscription disabled and marked authoritative."
 
-        Write-Section "Step 2 - Start DFSR and force AD polling" Cyan
+        Write-Section "Step 3 - Start DFSR and force AD polling" Cyan
         Start-Service DFSR
         Write-Ok "DFSR service started."
         Invoke-DfsrPollAd -Context 'after disabling local SYSVOL subscription'
@@ -2005,13 +2319,13 @@ function Invoke-Fix {
             Write-WarnMsg "Event ID 4114 was not detected in the current run window. Continuing because some systems log it late or not in the expected query window."
         }
 
-        Write-Section "Step 3 - Re-enable local SYSVOL subscription" Cyan
+        Write-Section "Step 4 - Re-enable local SYSVOL subscription" Cyan
         Set-ADObject -Identity $sysvolSubDn -Replace @{ 'msDFSR-Enabled' = $true }
         Write-Ok "Set msDFSR-Enabled=TRUE on local SYSVOL Subscription."
         Invoke-DfsrPollAd -Context 'after re-enabling local SYSVOL subscription'
         Add-Done "Local SYSVOL Subscription re-enabled and DFSR AD polling completed."
 
-        Write-Section "Step 4 - Restore service startup and restart required services" Cyan
+        Write-Section "Step 5 - Restore service startup and restart required services" Cyan
         Set-Service DFSR -StartupType Automatic
         Write-Ok "DFSR startup type set to Automatic."
         Restart-Service DFSR -Force
@@ -2070,6 +2384,8 @@ function Invoke-Fix {
     }
 
     $Script:Context['RecoverySucceeded'] = $true
+    Clear-ResolvedRecoveryWarnings
+    Write-Info "Initial DFSR State 5 / 4012 preflight warnings were resolved by the successful final validation."
 
     Show-RecentDfsrEvents
     Show-ServiceDiagnostics
