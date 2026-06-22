@@ -9,6 +9,7 @@ These scripts are intended for experienced Windows Server and Active Directory a
 | Script | Description |
 |---|---|
 | `Invoke-SysvolAuthoritativeSingleDC.ps1` | Checks and fixes supported DFSR SYSVOL issues on a single remaining Domain Controller, including Content Freshness failures and stale/orphaned Domain Controller references. |
+| `Invoke-SysvolAuthoritativeMultiDC.ps1` | **Experimental.** Checks and, when explicitly requested, performs a controlled authoritative DFSR SYSVOL re-initialization for domains with two or more reachable Domain Controllers. This script is not fully tested on real multi-DC environments. |
 
 ## Usage
 Open an elevated PowerShell session and run the selected script with `--help`.  
@@ -33,6 +34,8 @@ Review the output carefully before approving or starting any fix operation.
 
 ## Notes
 Some scripts may perform only checks. Others may also provide repair actions.  
+
+`Invoke-SysvolAuthoritativeMultiDC.ps1` is currently experimental and not fully tested because the author does not currently have access to multi-DC test systems. As stated in the general project disclaimer, review the code carefully and use it at your own risk.
 
 The exact behavior, parameters, logs, requirements, and safety gates are documented inside each script and shown with `--help`.
 
