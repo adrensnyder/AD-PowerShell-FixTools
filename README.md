@@ -29,8 +29,10 @@ Each script provides its own help page with supported parameters, examples, safe
 Read the script help first.  
 Review the code before using it in production.  
 Make sure you have a valid backup before running any operation that may change Active Directory, SYSVOL, DFSR, Group Policy, services, or system configuration.  
+
 **For any operation that may change DFSR synchronization, SYSVOL, Active Directory metadata, Domain Controller services, or related configuration, it is strongly recommended to have an up-to-date image-level backup and/or System State backup of each affected Domain Controller before running the script. These backups are not created by the scripts.**    
 **Any SYSVOL copy or backup created by a script is only a copy of SYSVOL content for that script workflow. It is not a full Domain Controller backup, not a System State backup, not an Active Directory backup, and not a complete rollback mechanism.**  
+
 Run scripts only in scenarios that match their documented purpose.  
 Review the output carefully before approving or starting any fix operation.  
 
